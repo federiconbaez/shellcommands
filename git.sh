@@ -849,14 +849,172 @@ interactive_rebase() {
 
 # Git add y commit en un solo paso
 git_add_commit() {
-    ensure_git_repo
+    # Verificar que estamos en un repositorio git
+    if ! git rev-parse --is-inside-work-tree &> /dev/null; then
+        error "No estás dentro de un repositorio Git."
+        return 1
+    fi
     
     echo -e "${BLUE}${BOLD}Git Add y Commit${RESET}"
     
+    # Obtener la rama actual
+    current_branch=$(git symbolic-ref --short HEAD 2>/dev/null)
+    if [ -z "$current_branch" ]; then
+        error "No se pudo determinar la rama actual."
+        return 1
+    fi
+    
     # Verificar si hay cambios para agregar
     if [ -z "$(git status --porcelain)" ]; then
-        error "No hay cambios para agregar."
-        return 1
+        warning "No hay cambios para agregar."
+        
+        # Verificar si hay commits para pushear
+        local ahead=0
+        local remote_exists=1
+        
+        # Verificar si hay un upstream configurado para la rama
+        if git rev-parse @{u} &>/dev/null; then
+            ahead=$(git rev-list --count @{u}..HEAD 2>/dev/null || echo "0")
+            remote_exists=0
+        fi
+        
+        if [ $remote_exists -eq 0 ] && [ "$ahead" -gt 0 ]; then
+            echo -e "${YELLOW}Tienes $ahead commit(s) local(es) que no están en el remoto.${RESET}"
+            
+            # Pushear cambios al remoto
+            read -p "¿Desea hacer push de los cambios al remoto? (s/N): " push_changes
+            if [[ "$push_changes" =~ ^[Ss]$ ]]; then
+                # Obtener el remoto configurado para la rama actual
+                local remote=$(git config --get branch.$current_branch.remote)
+                if [ -z "$remote" ]; then
+                    # Si no hay remoto configurado, preguntar
+                    echo -e "${YELLOW}No hay un remoto configurado para la rama actual.${RESET}"
+                    git remote -v
+                    read -p "Ingrese el nombre del remoto (ej. origin): " remote
+                    
+                    if [ -z "$remote" ]; then
+                        error "Se requiere un remoto para hacer push."
+                        return 1
+                    fi
+                fi
+                
+                echo -e "Haciendo push a ${CYAN}$remote/$current_branch${RESET}..."
+                git push "$remote" "$current_branch"
+                
+                if [ $? -eq 0 ]; then
+                    success "Cambios enviados al remoto exitosamente."
+                else
+                    error "Error al enviar cambios al remoto."
+                    echo -e "${YELLOW}¿Necesita configurar el upstream para esta rama?${RESET}"
+                    read -p "¿Desea configurar el upstream y reintentar? (s/N): " set_upstream
+                    
+                    if [[ "$set_upstream" =~ ^[Ss]$ ]]; then
+                        git push --set-upstream "$remote" "$current_branch"
+                        
+                        if [ $? -eq 0 ]; then
+                            success "Upstream configurado y push realizado correctamente."
+                        else
+                            error "No se pudo configurar el upstream. Verifique la configuración del remoto:"
+                            git remote -v
+                            read -p "¿Desea modificar la URL del remoto? (s/N): " modify_remote
+                            
+                            if [[ "$modify_remote" =~ ^[Ss]$ ]]; then
+                                read -p "Ingrese la nueva URL para $remote: " remote_url
+                                if [ -n "$remote_url" ]; then
+                                    git remote set-url "$remote" "$remote_url"
+                                    success "URL del remoto actualizada. Intente hacer push manualmente."
+                                fi
+                            fi
+                        fi
+                    fi
+                fi
+            else
+                echo -e "${YELLOW}No se enviaron cambios al remoto.${RESET}"
+            fi
+        elif [ $remote_exists -ne 0 ]; then
+            warning "Esta rama no tiene un remoto configurado."
+            git remote -v
+            
+            if [ -z "$(git remote)" ]; then
+                echo -e "${YELLOW}No hay remotos configurados en este repositorio.${RESET}"
+                read -p "¿Desea agregar un remoto? (s/N): " add_remote
+                
+                if [[ "$add_remote" =~ ^[Ss]$ ]]; then
+                    read -p "Nombre del remoto (ej. origin): " remote_name
+                    read -p "URL del remoto: " remote_url
+                    
+                    if [ -n "$remote_name" ] && [ -n "$remote_url" ]; then
+                        git remote add "$remote_name" "$remote_url"
+                        success "Remoto '$remote_name' agregado correctamente."
+                        
+                        read -p "¿Desea hacer push a este remoto? (s/N): " do_push
+                        if [[ "$do_push" =~ ^[Ss]$ ]]; then
+                            git push --set-upstream "$remote_name" "$current_branch"
+                            
+                            if [ $? -eq 0 ]; then
+                                success "Push realizado correctamente."
+                            else
+                                error "Error al hacer push."
+                            fi
+                        fi
+                    else
+                        error "Se requieren nombre y URL para agregar un remoto."
+                    fi
+                fi
+            else
+                read -p "¿Desea configurar un upstream para esta rama? (s/N): " set_upstream
+                
+                if [[ "$set_upstream" =~ ^[Ss]$ ]]; then
+                    echo "Remotos disponibles:"
+                    git remote -v
+                    read -p "Ingrese el nombre del remoto: " remote_name
+                    
+                    if [ -n "$remote_name" ]; then
+                        git push --set-upstream "$remote_name" "$current_branch"
+                        
+                        if [ $? -eq 0 ]; then
+                            success "Upstream configurado y push realizado correctamente."
+                        else
+                            error "Error al configurar el upstream."
+                        fi
+                    fi
+                fi
+            fi
+        else
+            echo -e "${GREEN}La rama está actualizada con el remoto.${RESET}"
+        fi
+
+        # Verificar si hay cambios en el stash
+        stash_count=$(git stash list | wc -l)
+
+        if [ "$stash_count" -gt 0 ]; then
+            echo -e "\n${BOLD}Cambios en el stash:${RESET} ${CYAN}$stash_count${RESET} entrada(s)"
+            git stash list | head -3 | sed 's/^/  /'
+            if [ "$stash_count" -gt 3 ]; then
+                echo "  ..."
+            fi
+            
+            read -p "¿Desea aplicar algún stash? (s/N): " apply_stash
+            if [[ "$apply_stash" =~ ^[Ss]$ ]]; then
+                read -p "Índice del stash a aplicar (Enter para el último): " stash_index
+                
+                if [ -z "$stash_index" ]; then
+                    git stash pop
+                else
+                    git stash pop "stash@{$stash_index}"
+                fi
+                
+                if [ $? -eq 0 ]; then
+                    success "Stash aplicado correctamente."
+                else
+                    error "Error al aplicar el stash."
+                fi
+            fi
+        else
+            echo -e "${GREEN}No hay cambios en el stash.${RESET}"
+        fi
+        
+        return 0
     fi
     
     # Mostrar cambios actuales
@@ -868,19 +1026,44 @@ git_add_commit() {
     echo "  1. Agregar todos los archivos"
     echo "  2. Agregar archivos específicos"
     echo "  3. Agregar archivos interactivamente"
-    read -p "Seleccione una opción [1-3]: " add_option
+    echo "  4. Ver diferencias antes de agregar"
+    read -p "Seleccione una opción [1-4]: " add_option
     
     case "$add_option" in
         2)
             read -p "Archivos a agregar (separados por espacio): " files_to_add
-            git add $files_to_add
+            if [ -n "$files_to_add" ]; then
+                git add $files_to_add
+                echo -e "${GREEN}Archivos agregados.${RESET}"
+            else
+                error "No se especificaron archivos."
+                return 1
+            fi
             ;;
         3)
             git add -i
             ;;
+        4)
+            # Mostrar diferencias y luego preguntar qué agregar
+            git diff
+            read -p "¿Desea agregar todos los archivos? (s/N): " add_all
+            if [[ "$add_all" =~ ^[Ss]$ ]]; then
+                git add .
+                echo -e "${GREEN}Todos los archivos agregados.${RESET}"
+            else
+                read -p "Archivos a agregar (separados por espacio): " files_to_add
+                if [ -n "$files_to_add" ]; then
+                    git add $files_to_add
+                    echo -e "${GREEN}Archivos seleccionados agregados.${RESET}"
+                else
+                    error "No se especificaron archivos."
+                    return 1
+                fi
+            fi
+            ;;
         *)
             git add .
-            echo "Agregando todos los archivos..."
+            echo -e "${GREEN}Agregando todos los archivos...${RESET}"
             ;;
     esac
     
@@ -896,27 +1079,108 @@ git_add_commit() {
         return 1
     fi
     
-    # Realizar el commit
-    git commit -m "$commit_msg"
+    # Preguntar por mensaje extendido
+    read -p "¿Desea agregar un mensaje de commit extendido? (s/N): " extended_msg
+    
+    if [[ "$extended_msg" =~ ^[Ss]$ ]]; then
+        echo "Ingrese el mensaje extendido (termine con Ctrl+D en una nueva línea):"
+        extended_content=$(cat)
+        
+        # Realizar el commit con mensaje extendido
+        git commit -m "$commit_msg" -m "$extended_content"
+    else
+        # Realizar el commit
+        git commit -m "$commit_msg"
+    fi
     
     if [ $? -eq 0 ]; then
         success "Commit realizado exitosamente."
+        
+        # Mostrar el último commit
+        echo -e "\n${BOLD}Último commit:${RESET}"
+        git show --stat HEAD
         
         # Preguntar si desea hacer push
         read -p "¿Desea hacer push de los cambios? (s/N): " do_push
         
         if [[ "$do_push" =~ ^[Ss]$ ]]; then
-            current_branch=$(git symbolic-ref --short HEAD 2>/dev/null)
-            git push origin "$current_branch"
+            # Obtener el remoto configurado para la rama actual
+            local remote=$(git config --get branch.$current_branch.remote)
+            
+            if [ -z "$remote" ]; then
+                # Si no hay remoto configurado, preguntar
+                echo -e "${YELLOW}No hay un remoto configurado para la rama actual.${RESET}"
+                git remote -v
+                
+                if [ -z "$(git remote)" ]; then
+                    echo -e "${YELLOW}No hay remotos configurados en este repositorio.${RESET}"
+                    read -p "¿Desea agregar un remoto? (s/N): " add_remote
+                    
+                    if [[ "$add_remote" =~ ^[Ss]$ ]]; then
+                        read -p "Nombre del remoto (ej. origin): " remote_name
+                        read -p "URL del remoto: " remote_url
+                        
+                        if [ -n "$remote_name" ] && [ -n "$remote_url" ]; then
+                            git remote add "$remote_name" "$remote_url"
+                            success "Remoto '$remote_name' agregado correctamente."
+                            remote="$remote_name"
+                        else
+                            error "Se requieren nombre y URL para agregar un remoto."
+                            return 1
+                        fi
+                    else
+                        return 0
+                    fi
+                else 
+                    read -p "Ingrese el nombre del remoto para push (ej. origin): " remote
+                    
+                    if [ -z "$remote" ]; then
+                        error "Se requiere un remoto para hacer push."
+                        return 1
+                    fi
+                fi
+            fi
+            
+            # Intentar push
+            echo -e "Haciendo push a ${CYAN}$remote/$current_branch${RESET}..."
+            git push "$remote" "$current_branch"
             
             if [ $? -eq 0 ]; then
-                success "Push realizado correctamente a $current_branch."
+                success "Push realizado correctamente a $remote/$current_branch."
             else
                 error "Error al hacer push. Puede que necesite configurar el upstream."
                 read -p "¿Desea configurar el upstream y reintentar? (s/N): " set_upstream
                 
                 if [[ "$set_upstream" =~ ^[Ss]$ ]]; then
-                    git push --set-upstream origin "$current_branch"
+                    git push --set-upstream "$remote" "$current_branch"
+                    
+                    if [ $? -eq 0 ]; then
+                        success "Upstream configurado y push realizado correctamente."
+                    else
+                        error "No se pudo hacer push. Verifique la configuración del remoto."
+                        git remote -v
+                        read -p "¿Desea modificar la URL del remoto? (s/N): " modify_remote
+                        
+                        if [[ "$modify_remote" =~ ^[Ss]$ ]]; then
+                            read -p "Ingrese la nueva URL para $remote: " remote_url
+                            if [ -n "$remote_url" ]; then
+                                git remote set-url "$remote" "$remote_url"
+                                success "URL del remoto actualizada."
+                                
+                                # Intentar push nuevamente
+                                read -p "¿Desea intentar push nuevamente? (s/N): " retry_push
+                                if [[ "$retry_push" =~ ^[Ss]$ ]]; then
+                                    git push --set-upstream "$remote" "$current_branch"
+                                
+                                    if [ $? -eq 0 ]; then
+                                        success "Push realizado correctamente."
+                                    else
+                                        error "Error al hacer push nuevamente."
+                                    fi
+                                fi
+                            fi
+                        fi
+                    fi
                 fi
             fi
         fi
@@ -1291,11 +1555,38 @@ resolve_conflicts() {
 }
 
 # ============== FUNCIONES DE GITHUB ==============
+
+
+# Función para listar repositorios de GitHub
+list_github_repos() {
+    echo -e "${BLUE}Mis Repositorios en GitHub${RESET}"
+    
+    validate_token || return 1
+    
+    echo -e "Consultando repositorios para ${YELLOW}$GITHUB_USERNAME${RESET}..."
+    
+    # Obtener repositorios
+    response=$(curl -s -H "Authorization: token $GITHUB_TOKEN" "$GITHUB_API/user/repos?per_page=100")
+    
+    if echo "$response" | grep -q "message.*API rate limit exceeded"; then
+        echo -e "${RED}Se ha excedido el límite de la API de GitHub.${RESET}"
+        return 1
+    fi
+    
+    # Imprimir repositorios
+    echo -e "\n${BOLD}Repositorios disponibles:${RESET}"
+    echo "$response" | grep -E '"full_name"|"html_url"|"default_branch"|"private"' | \
+        sed -E 's/"full_name": "([^"]+)",/\n\1/g' | \
+        sed -E 's/"html_url": "([^"]+)",/  URL: \1/g' | \
+        sed -E 's/"default_branch": "([^"]+)",/  Rama principal: \1/g' | \
+        sed -E 's/"private": (true|false),/  Privado: \1/g' | \
+        grep -v "^  *$"
+}
+
 # Función para crear un nuevo repositorio en GitHub
 create_github_repo() {
     echo -e "${BLUE}Crear Nuevo Repositorio en GitHub${RESET}"
     
-    # Verificar token de GitHub
     validate_token || return 1
     
     # Validar entrada del usuario
@@ -1342,14 +1633,28 @@ create_github_repo() {
         return 1
     fi
     
-    # Verificar respuesta
+    # Verificar si el repositorio se creó correctamente
     if echo "$response" | grep -q "\"name\":\"$repo_name\"" || echo "$response" | grep -q "\"name\":.*\"$repo_name\""; then
-        # Extracción más robusta de la URL
-        if ! repo_url=$(echo "$response" | grep -o '"html_url":"[^"]*"' | head -1 | sed 's/"html_url":"//;s/"//'); then
-            repo_url="$GITHUB_API/repos/$GITHUB_USERNAME/$repo_name"
+        # Extraer la URL del repositorio - método más robusto
+        repo_url=""
+        
+        # Intento 1: Extraer directamente de la respuesta
+        if repo_url=$(echo "$response" | grep -o '"html_url":"[^"]*"' | head -1 | sed 's/"html_url":"//;s/"//'); then
+            echo -e "${GREEN}Repositorio creado exitosamente: $repo_url${RESET}"
+        else
+            # Intento 2: Construir la URL basada en el nombre de usuario y repositorio
+            echo -e "${YELLOW}No se pudo extraer la URL directamente. Construyendo URL alternativa...${RESET}"
+            repo_url="https://github.com/$GITHUB_USERNAME/$repo_name"
+            echo -e "${GREEN}Repositorio creado exitosamente: $repo_url${RESET}"
         fi
         
-        echo -e "${GREEN}Repositorio creado exitosamente: $repo_url${RESET}"
+        # Verificar que tenemos una URL válida antes de continuar
+        if [ -z "$repo_url" ]; then
+            echo -e "${RED}Error: No se pudo determinar la URL del repositorio.${RESET}"
+            echo -e "${YELLOW}El repositorio probablemente se creó, pero deberá configurar el remoto manualmente.${RESET}"
+            echo -e "${YELLOW}URL probable: https://github.com/$GITHUB_USERNAME/$repo_name${RESET}"
+            return 1
+        fi
         
         # Preguntar si desea inicializar el repositorio local
         read -p "¿Desea inicializar un repositorio local y vincularlo? (s/n): " init_local
@@ -1381,31 +1686,23 @@ create_github_repo() {
             
             git add README.md
             git commit -m "Inicialización del repositorio"
-            git branch -M main
-            git remote add origin "$repo_url"
             
-            # Configurar el upstream
-            echo "Configurando upstream para la rama $branch_name..."
-            git push --set-upstream "$DEFAULT_REMOTE" "$branch_name"
-            if [ $? -eq 0 ]; then
-                success "Upstream configurado para la rama '$branch_name'."
-            else
-                error "Error al configurar el upstream."
-            fi
-            # Configurar remote origin y remote set-url
-            git remote set-url "$DEFAULT_REMOTE" "$branch_name"
-
-            if [ $? -eq 0 ]; then
-                success "Remote origin configurado para la rama '$branch_name'."
-            else
-                error "Error al configurar el remote origin."
+            # Asegurar que la rama principal se llama 'master'
+            echo -e "${YELLOW}Configurando rama principal como 'master'...${RESET}"
+            git branch -M master
+            
+            # Agregar remoto
+            echo -e "${YELLOW}Configurando remoto 'origin' a $repo_url...${RESET}"
+            if ! git remote add origin "$repo_url"; then
+                echo -e "${RED}Error al configurar el remoto origin.${RESET}"
+                return 1
             fi
             
-            # Subir cambios iniciales al repositorio remoto
+            # Push inicial
             echo -e "${YELLOW}Subiendo cambios iniciales al repositorio remoto...${RESET}"
-            if ! git push -u origin main; then
+            if ! git push -u origin master; then
                 echo -e "${RED}Error al subir cambios al repositorio remoto.${RESET}"
-                echo -e "${YELLOW}Puede intentar manualmente con: git push -u origin main${RESET}"
+                echo -e "${YELLOW}Puede intentar manualmente con: git push -u origin master${RESET}"
                 return 1
             fi
             
@@ -1507,7 +1804,7 @@ create_pull_request() {
     echo "$branches_response" | jq -r '.[].name' | sort | sed 's/^/  /'
     
     # Solicitar información del PR
-    read -p "Rama base (destino, generalmente 'main' o 'master'): " base_branch
+    read -p "Rama base (destino, generalmente 'master'): " base_branch
     
     if [ -z "$base_branch" ]; then
         error "La rama base es obligatoria."
