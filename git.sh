@@ -270,6 +270,36 @@ create_branch() {
         # Preguntar si desea configurar el upstream
         read -p "¿Desea publicar esta rama en el remoto? (s/N): " push_branch
         if [[ "$push_branch" =~ ^[Ss]$ ]]; then
+
+            # Preguntar si desea configurar el remote origin
+            read -p "¿Desea configurar el remote origin para esta rama? (s/N): " set_remote
+            git remote add origin "$GITHUB_API/$branch_name.git"
+            if [[ "$set_remote" =~ ^[Ss]$ ]]; then
+                echo "Configurando remote origin para la rama $branch_name..."
+                git remote set-url origin "$GITHUB_API/$branch_name.git"
+            fi
+
+            # Configurar el remote origin
+            echo "Configurando remote origin para la rama $branch_name..."
+            git remote set-url origin "$GITHUB_API/$branch_name.git"
+
+            # Verificar si el remote origin se configuró correctamente
+            if [ $? -eq 0 ]; then
+                success "Remote origin configurado para la rama '$branch_name'."
+            else
+                error "Error al configurar el remote origin."
+            fi
+
+            # Configurar el upstream
+            echo "Configurando upstream para la rama $branch_name..."
+            git push --set-upstream origin "$branch_name"
+            if [ $? -eq 0 ]; then
+                success "Upstream configurado para la rama '$branch_name'."
+            else
+                error "Error al configurar el upstream."
+            fi
+
+            # Preguntar si desea hacer push de la rama
             git push -u origin "$branch_name"
             if [ $? -eq 0 ]; then
                 success "Rama publicada en el remoto."
@@ -817,6 +847,84 @@ interactive_rebase() {
     fi
 }
 
+# Git add y commit en un solo paso
+git_add_commit() {
+    ensure_git_repo
+    
+    echo -e "${BLUE}${BOLD}Git Add y Commit${RESET}"
+    
+    # Verificar si hay cambios para agregar
+    if [ -z "$(git status --porcelain)" ]; then
+        error "No hay cambios para agregar."
+        return 1
+    fi
+    
+    # Mostrar cambios actuales
+    echo -e "${BOLD}Cambios actuales:${RESET}"
+    git status -s
+    
+    # Opciones para agregar archivos
+    echo -e "\n${BOLD}Opciones para agregar archivos:${RESET}"
+    echo "  1. Agregar todos los archivos"
+    echo "  2. Agregar archivos específicos"
+    echo "  3. Agregar archivos interactivamente"
+    read -p "Seleccione una opción [1-3]: " add_option
+    
+    case "$add_option" in
+        2)
+            read -p "Archivos a agregar (separados por espacio): " files_to_add
+            git add $files_to_add
+            ;;
+        3)
+            git add -i
+            ;;
+        *)
+            git add .
+            echo "Agregando todos los archivos..."
+            ;;
+    esac
+    
+    # Confirmar qué se va a enviar
+    echo -e "\n${BOLD}Archivos preparados para commit:${RESET}"
+    git status -s
+    
+    # Solicitar mensaje de commit
+    read -p "Mensaje de commit: " commit_msg
+    
+    if [ -z "$commit_msg" ]; then
+        error "El mensaje de commit no puede estar vacío."
+        return 1
+    fi
+    
+    # Realizar el commit
+    git commit -m "$commit_msg"
+    
+    if [ $? -eq 0 ]; then
+        success "Commit realizado exitosamente."
+        
+        # Preguntar si desea hacer push
+        read -p "¿Desea hacer push de los cambios? (s/N): " do_push
+        
+        if [[ "$do_push" =~ ^[Ss]$ ]]; then
+            current_branch=$(git symbolic-ref --short HEAD 2>/dev/null)
+            git push origin "$current_branch"
+            
+            if [ $? -eq 0 ]; then
+                success "Push realizado correctamente a $current_branch."
+            else
+                error "Error al hacer push. Puede que necesite configurar el upstream."
+                read -p "¿Desea configurar el upstream y reintentar? (s/N): " set_upstream
+                
+                if [[ "$set_upstream" =~ ^[Ss]$ ]]; then
+                    git push --set-upstream origin "$current_branch"
+                fi
+            fi
+        fi
+    else
+        error "Error al realizar el commit."
+    fi
+}
+
 # Cherry-pick commits
 cherry_pick_commits() {
     ensure_git_repo
@@ -1183,6 +1291,160 @@ resolve_conflicts() {
 }
 
 # ============== FUNCIONES DE GITHUB ==============
+# Función para crear un nuevo repositorio en GitHub
+create_github_repo() {
+    echo -e "${BLUE}Crear Nuevo Repositorio en GitHub${RESET}"
+    
+    # Verificar token de GitHub
+    validate_token || return 1
+    
+    # Validar entrada del usuario
+    while true; do
+        read -p "Nombre del repositorio: " repo_name
+        if [ -z "$repo_name" ]; then
+            echo -e "${RED}Error: El nombre del repositorio no puede estar vacío.${RESET}"
+        else
+            # Verificar si ya existe el repositorio
+            check_response=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $GITHUB_TOKEN" "$GITHUB_API/repos/$GITHUB_USERNAME/$repo_name")
+            if [ "$check_response" = "200" ]; then
+                echo -e "${YELLOW}Advertencia: Ya existe un repositorio con ese nombre.${RESET}"
+                read -p "¿Desea usar otro nombre? (s/n): " change_name
+                [ "$change_name" = "s" ] || [ "$change_name" = "S" ] && continue
+            fi
+            break
+        fi
+    done
+    
+    read -p "Descripción (opcional): " repo_description
+    read -p "¿Repositorio privado? (s/n): " is_private
+    
+    if [ "$is_private" = "s" ] || [ "$is_private" = "S" ]; then
+        private="true"
+    else
+        private="false"
+    fi
+    
+    # Sanitizar inputs para JSON
+    repo_name=$(echo "$repo_name" | sed 's/"/\\"/g')
+    repo_description=$(echo "$repo_description" | sed 's/"/\\"/g')
+    
+    # Crear JSON para la solicitud
+    json_data="{\"name\":\"$repo_name\",\"description\":\"$repo_description\",\"private\":$private}"
+    
+    echo -e "${YELLOW}Creando repositorio...${RESET}"
+    
+    # Enviar solicitud a GitHub API
+    response=$(curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" -H "Content-Type: application/json" -d "$json_data" "$GITHUB_API/user/repos")
+    
+    # Verificar si hay problemas de límite de API
+    if echo "$response" | grep -q "API rate limit exceeded"; then
+        echo -e "${RED}Error: Se ha excedido el límite de la API de GitHub. Inténtelo más tarde.${RESET}"
+        return 1
+    fi
+    
+    # Verificar respuesta
+    if echo "$response" | grep -q "\"name\":\"$repo_name\"" || echo "$response" | grep -q "\"name\":.*\"$repo_name\""; then
+        # Extracción más robusta de la URL
+        if ! repo_url=$(echo "$response" | grep -o '"html_url":"[^"]*"' | head -1 | sed 's/"html_url":"//;s/"//'); then
+            repo_url="$GITHUB_API/repos/$GITHUB_USERNAME/$repo_name"
+        fi
+        
+        echo -e "${GREEN}Repositorio creado exitosamente: $repo_url${RESET}"
+        
+        # Preguntar si desea inicializar el repositorio local
+        read -p "¿Desea inicializar un repositorio local y vincularlo? (s/n): " init_local
+        
+        if [ "$init_local" = "s" ] || [ "$init_local" = "S" ]; then
+            read -p "Directorio para el repositorio (Enter para directorio actual): " repo_dir
+            
+            if [ -n "$repo_dir" ]; then
+                if ! mkdir -p "$repo_dir" 2>/dev/null; then
+                    echo -e "${RED}Error: No se pudo crear el directorio '$repo_dir'.${RESET}"
+                    return 1
+                fi
+                if ! cd "$repo_dir" 2>/dev/null; then
+                    echo -e "${RED}Error: No se pudo acceder al directorio '$repo_dir'.${RESET}"
+                    return 1
+                fi
+                echo -e "${GREEN}Usando directorio: $(pwd)${RESET}"
+            fi
+            
+            echo -e "${YELLOW}Inicializando repositorio local...${RESET}"
+            
+            if ! git init; then
+                echo -e "${RED}Error al inicializar el repositorio git.${RESET}"
+                return 1
+            fi
+            
+            echo "# $repo_name" > README.md
+            echo -e "\n$repo_description" >> README.md
+            
+            git add README.md
+            git commit -m "Inicialización del repositorio"
+            git branch -M main
+            git remote add origin "$repo_url"
+            
+            # Configurar el upstream
+            echo "Configurando upstream para la rama $branch_name..."
+            git push --set-upstream "$DEFAULT_REMOTE" "$branch_name"
+            if [ $? -eq 0 ]; then
+                success "Upstream configurado para la rama '$branch_name'."
+            else
+                error "Error al configurar el upstream."
+            fi
+            # Configurar remote origin y remote set-url
+            git remote set-url "$DEFAULT_REMOTE" "$branch_name"
+
+            if [ $? -eq 0 ]; then
+                success "Remote origin configurado para la rama '$branch_name'."
+            else
+                error "Error al configurar el remote origin."
+            fi
+            
+            # Subir cambios iniciales al repositorio remoto
+            echo -e "${YELLOW}Subiendo cambios iniciales al repositorio remoto...${RESET}"
+            if ! git push -u origin main; then
+                echo -e "${RED}Error al subir cambios al repositorio remoto.${RESET}"
+                echo -e "${YELLOW}Puede intentar manualmente con: git push -u origin main${RESET}"
+                return 1
+            fi
+            
+            echo -e "${GREEN}Repositorio local inicializado y vinculado exitosamente.${RESET}"
+        fi
+    else
+        # Extraer mensaje de error más detallado
+        if ! error_msg=$(echo "$response" | grep -o '"message":"[^"]*"' | head -1 | sed 's/"message":"//;s/"//'); then
+            error_msg="Error desconocido. Compruebe su conexión e inténtelo de nuevo."
+        fi
+        echo -e "${RED}Error al crear el repositorio: $error_msg${RESET}"
+        
+        if echo "$error_msg" | grep -q "already exists"; then
+            echo -e "${YELLOW}Sugerencia: Intente con otro nombre para el repositorio.${RESET}"
+        elif echo "$error_msg" | grep -q "authenticated"; then
+            echo -e "${YELLOW}Sugerencia: Verifique su token de GitHub ejecutando la opción 16 del menú.${RESET}"
+        fi
+    fi
+}
+
+# Función para validar token de GitHub
+validate_token() {
+    if [ -z "$GITHUB_TOKEN" ]; then
+        echo -e "${YELLOW}No se ha configurado un token de GitHub.${RESET}"
+        configure_github
+        return 1
+    fi
+    
+    # Verificar si el token es válido
+    response=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $GITHUB_TOKEN" $GITHUB_API/user)
+    
+    if [ "$response" != "200" ]; then
+        echo -e "${RED}Token de GitHub inválido o expirado.${RESET}"
+        configure_github
+        return 1
+    fi
+    
+    return 0
+}
 
 create_pull_request() {
     ensure_github_token
@@ -1599,7 +1861,7 @@ show_menu() {
     echo -e "7. Stash: guardar cambios temporalmente"
     echo -e "8. Aplicar cambios desde stash"
     echo -e "9. Rebase interactivo"
-    echo -e "10. Cherry-pick commits"
+    echo -e "10. Guardar y subir cambios"
     echo -e "11. Resolver conflictos"
     echo
     echo -e "${BOLD}${GREEN}-- Operaciones con GitHub --${RESET}"
@@ -1780,7 +2042,7 @@ main() {
             7) stash_changes ;;
             8) apply_stash ;;
             9) interactive_rebase ;;
-            10) cherry_pick_commits ;;
+            10) git_add_commit ;;
             11) resolve_conflicts ;;
             12) list_github_repos ;;
             13) create_github_repo ;;
